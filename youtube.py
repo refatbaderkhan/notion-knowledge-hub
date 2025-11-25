@@ -46,7 +46,8 @@ class YoutubeVideoExtractor:
         try:
             transcript_list = self.transcript_client.list(youtube_id)
             transcript = transcript_list.find_transcript(["en", "ar"]).fetch()
-            return self.formatter.format_transcript(transcript)
+            return self.formatter.format_transcript(transcript).splitlines()
+
         except (TranscriptsDisabled, NoTranscriptFound):
             logger.warning(f"Transcripts unavailable for {youtube_id}")
             return None
@@ -61,8 +62,8 @@ class YoutubeVideoExtractor:
             logger.warning(f"failed to extract data {youtube_id}")
             return None
 
+        data["url"] = f"https://www.youtube.com/watch?v={youtube_id}"
         data["transcript"] = self._get_transcript(youtube_id)
-
         logger.info(f"Successfully extracted data for {youtube_id}")
         return data
 

@@ -143,8 +143,8 @@ class NotionScript:
             return None
 
     def create_media(self, data):
-        logger.info("Starting Media page creation for: %s", data["video_name"])
-        entity_name = data["channel_name"].strip()
+        logger.info("Starting Media page creation for: %s", data["title"])
+        entity_name = data["channelTitle"].strip()
         entity_id = self.get_or_create_entity(entity_name)
         today_iso = self._get_today_iso()
         if not entity_id:
@@ -161,11 +161,11 @@ class NotionScript:
                         "data_source_id": self.media_db_id,
                     },
                     "properties": {
-                        "Title": {"title": [{"text": {"content": data["video_name"]}}]},
+                        "Title": {"title": [{"text": {"content": data["title"]}}]},
                         "Media Type": {"select": {"name": "Video"}},
                         "Author/Creator": {"relation": [{"id": entity_id}]},
                         "URL": {"url": data["url"]},
-                        "Publishing Date": {"date": {"start": data["upload_date"]}},
+                        "Publishing Date": {"date": {"start": data["publishedAt"]}},
                         "Adding Date": {"date": {"start": today_iso}},
                         "Status": {"select": {"name": "Inbox"}},
                     },
@@ -173,7 +173,7 @@ class NotionScript:
                 }
             )
             media_page_id = response["id"]
-            logger.info("CREATED MEDIA: %s | ID: %s", data["video_name"], media_page_id)
+            logger.info("CREATED MEDIA: %s | ID: %s", data["title"], media_page_id)
 
             for snippet in data["extracted_snippets"]:
                 self.create_snippet(snippet, media_page_id)
