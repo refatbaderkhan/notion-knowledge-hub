@@ -2,5 +2,5 @@
 *.pyc
 *.log
 .venv/
-config.py
 output_data/
+.DS_Store

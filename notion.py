@@ -1,123 +1,79 @@
 import functools
-import json
 import logging
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from notion_client import Client
 from notion_client.errors import APIResponseError
+
+import config
 
 logger = logging.getLogger(__name__)
 
 
 class NotionIngester:
-    def __init__(self, api_key, entities_db_id, media_db_id, snippet_db_id):
-        if not api_key:
-            raise ValueError("API Key is required to initialize NotionIngester")
+    def __init__(self):
+        if not config.NOTION_API_KEY:
+            raise ValueError("NOTION_API_KEY is required.")
 
-        try:
-            self.notion_client = Client(auth=api_key)
-            self.entities_db_id = entities_db_id
-            self.media_db_id = media_db_id
-            self.snippet_db_id = snippet_db_id
-        except Exception as e:
-            logger.critical("Failed to initialize Notion Client: %s", e)
-            raise
+        self.client = Client(auth=config.NOTION_API_KEY)
 
-    def _get_today_iso(self):
+        self.entities_db = config.ENTITIES_DB_ID
+        self.media_db = config.MEDIA_DB_ID
+        self.snippet_db = config.SNIPPETS_DB_ID
+
+    def _get_today_iso(self) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
-    @staticmethod
-    def load_data_from_json(json_path):
-        logger.info("Loading %s", json_path)
+    def _prepare_markdown_blocks(self, text: str) -> List[Dict[str, Any]]:
+        chunk_size = 1900
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+        return [
+            {
+                "object": "block",
+                "type": "code",
+                "code": {
+                    "rich_text": [{"type": "text", "text": {"content": chunk}}],
+                    "language": "markdown",
+                },
+            }
+            for chunk in chunks
+        ]
+
+    @functools.cache
+    def get_or_create_entity(self, name: str) -> Optional[str]:
+        name = name.strip()
+        if not name:
+            return None
+
+        logger.info(f"Resolving entity: {name}")
+
         try:
-            with open(json_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                logger.info(
-                    "Successfully loaded JSON with %d top-level keys", len(data)
-                )
-                return data
-        except FileNotFoundError:
-            logger.error("JSON file not found: %s", json_path)
-            raise
-        except json.JSONDecodeError as e:
-            logger.error("Failed to parse JSON file: %s", e)
-            raise
-        except Exception as e:
-            logger.error("Unexpected error loading JSON: %s", e)
-            raise
-
-    def _split_into_chunks(self, text, chunk_size=1900):
-        return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-    def _create_code_blocks(self, chunks):
-        children = []
-        for chunk in chunks:
-            children.append(
-                {
-                    "object": "block",
-                    "type": "code",
-                    "code": {
-                        "rich_text": [
-                            {
-                                "type": "text",
-                                "text": {"content": chunk},
-                            }
-                        ],
-                        "language": "markdown",
+            response = self.client.data_sources.query(
+                **{
+                    "data_source_id": self.entities_db,
+                    "filter": {
+                        "or": [
+                            {"property": "Aliases", "multi_select": {"contains": name}},
+                            {"property": "Name", "title": {"equals": name}},
+                        ]
                     },
                 }
             )
-        return children
 
-    def prepare_summary_blocks(self, text):
-        chunks = self._split_into_chunks(text, chunk_size=1900)
-        logger.info("Summary split into %d chunks.", len(chunks))
-        return self._create_code_blocks(chunks)
-
-    @functools.cache
-    def get_or_create_entity(self, name):
-        logger.info("API CALL (CACHE MISS): Querying for entity: %s", name)
-        name = name.strip()
-
-        if not name:
-            logger.warning("Empty entity name provided")
-            return None
-
-        try:
-            compound_filter = {
-                "or": [
-                    {"property": "Aliases", "multi_select": {"contains": name}},
-                    {"property": "Name", "title": {"equals": name}},
-                ]
-            }
-
-            response = self.notion_client.data_sources.query(
-                **{
-                    "data_source_id": self.entities_db_id,
-                    "filter": compound_filter,
-                }
-            )
             if response["results"]:
                 entity_id = response["results"][0]["id"]
                 logger.info("CACHE POPULATED: Found existing entity ID: %s", entity_id)
                 return entity_id
 
-        except APIResponseError as e:
-            logger.error(
-                "API ERROR during entity lookup: %s | Response: %s",
-                e.status_code,
-                e.response.json(),
-            )
-        except Exception as e:
-            logger.error("Unexpected error during entity lookup: %s", e)
+            logger.info("Entity not found. creating: %s", name)
 
-        logger.info("Entity not found. creating: %s", name)
-        try:
-            response = self.notion_client.pages.create(
+            new_page = self.client.pages.create(
                 **{
                     "parent": {
                         "type": "data_source_id",
-                        "data_source_id": self.entities_db_id,
+                        "data_source_id": self.entities_db,
                     },
                     "properties": {
                         "Name": {"title": [{"text": {"content": name}}]},
@@ -125,28 +81,21 @@ class NotionIngester:
                     },
                 }
             )
-            entity_id = response["id"]
+
+            entity_id = new_page["id"]
             logger.info("CREATED ENTITY: %s | ID: %s", name, entity_id)
             return entity_id
 
-        except APIResponseError as e:
-            logger.error(
-                "API ERROR during entity CREATION for %s: %s | Response: %s",
-                name,
-                e.status_code,
-                e.response.json(),
-            )
-            return None
-
         except Exception as e:
-            logger.error("Unexpected error during entity creation for %s: %s", name, e)
+            logger.error(f"Error resolving entity '{name}': {e}")
             return None
 
-    def create_media(self, data):
-        logger.info("Starting Media page creation for: %s", data["title"])
+    def create_media(self, data: Dict[str, Any]) -> Optional[str]:
+        logger.info(f"Creating Media page: {data.get('title')}")
         entity_name = data["channelTitle"].strip()
+
         entity_id = self.get_or_create_entity(entity_name)
-        today_iso = self._get_today_iso()
+
         if not entity_id:
             logger.error(
                 "FATAL: Could not get or create author entity. Aborting media creation."
@@ -154,11 +103,12 @@ class NotionIngester:
             return None
 
         try:
-            response = self.notion_client.pages.create(
+            # --- FIX 5: Use self.client and self.media_db ---
+            response = self.client.pages.create(
                 **{
                     "parent": {
                         "type": "data_source_id",
-                        "data_source_id": self.media_db_id,
+                        "data_source_id": self.media_db,
                     },
                     "properties": {
                         "Title": {"title": [{"text": {"content": data["title"]}}]},
@@ -166,34 +116,32 @@ class NotionIngester:
                         "Author/Creator": {"relation": [{"id": entity_id}]},
                         "URL": {"url": data["url"]},
                         "Publishing Date": {"date": {"start": data["publishedAt"]}},
-                        "Adding Date": {"date": {"start": today_iso}},
+                        "Adding Date": {"date": {"start": self._get_today_iso()}},
                         "Status": {"select": {"name": "Inbox"}},
                     },
-                    "children": self.prepare_summary_blocks(data["full_summary"]),
+                    # Note: verify _prepare_markdown_blocks is named correctly in your class
+                    # (In your provided file it was named _prepare_markdown_blocks, but called as prepare_summary_blocks?
+                    #  I will assume you use the name defined in this file: _prepare_markdown_blocks)
+                    "children": self._prepare_markdown_blocks(data["full_summary"]),
                 }
             )
             media_page_id = response["id"]
             logger.info("CREATED MEDIA: %s | ID: %s", data["title"], media_page_id)
 
-            for snippet in reversed(data["extracted_snippets"]):
-                self.create_snippet(snippet, media_page_id)
+            snippets = data.get("extracted_snippets", [])
+            logger.info(f"Processing {len(snippets)} snippets...")
+
+            for snippet in reversed(snippets):
+                self._create_snippet(snippet, media_page_id)
 
             return media_page_id
 
-        except APIResponseError as e:
-            logger.error(
-                "API ERROR creating media page: %s | Response: %s",
-                e.status_code,
-                e.response.json(),
-            )
-            return None
         except Exception as e:
-            logger.error("Unexpected error during media creation: %s", e)
+            logger.error(f"Failed to create media page: {e}", exc_info=True)
             return None
 
-    def create_snippet(self, snippet, media_source):
+    def _create_snippet(self, snippet: Dict[str, Any], media_id: str) -> None:
         entities = []
-        today_iso = self._get_today_iso()
         for entity_name in snippet.get("entities", []):
             linked_entity = self.get_or_create_entity(entity_name)
             if linked_entity:
@@ -201,103 +149,51 @@ class NotionIngester:
 
         properties = {
             "Context": {"title": [{"text": {"content": snippet["context"]}}]},
-            "Source": {"relation": [{"id": media_source}]},
+            "Source": {"relation": [{"id": media_id}]},
             "Entities": {"relation": entities},
             "Note Type": {"select": {"name": "Automated Note"}},
             "Status": {"select": {"name": "Inbox"}},
-            "Adding Date": {"date": {"start": today_iso}},
+            "Adding Date": {"date": {"start": self._get_today_iso()}},
         }
 
-        if snippet["event_date"].get("human_readable"):
+        event_data = snippet.get("event_date", {})
+        if event_data.get("human_readable") and event_data["human_readable"] != "null":
             properties["Event Date"] = {
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {"content": snippet["event_date"]["human_readable"]},
-                    }
-                ]
+                "rich_text": [{"text": {"content": event_data["human_readable"]}}]
             }
 
-        start_date_iso = snippet["event_date"].get("date_start_iso")
-        if start_date_iso:
-            try:
-                datetime.strptime(start_date_iso, "%Y-%m-%d")
-                properties["Start Date"] = {"date": {"start": start_date_iso}}
-            except ValueError:
-                logger.warning(
-                    f"Skipping Start Date property. Invalid ISO format found: '{start_date_iso}' for snippet: {snippet['context'][:50]}..."
-                )
+        date_mapping = [("date_start_iso", "Start Date"), ("date_end_iso", "End Date")]
 
-        end_date_iso = snippet["event_date"].get("date_end_iso")
-        if end_date_iso:
-            try:
-                datetime.strptime(end_date_iso, "%Y-%m-%d")
-                properties["End Date"] = {"date": {"start": end_date_iso}}
-            except ValueError:
-                logger.warning(
-                    f"Skipping End Date property. Invalid ISO format found: '{end_date_iso}' for snippet: {snippet['context'][:50]}..."
-                )
+        for json_key, notion_column in date_mapping:
+            val = event_data.get(json_key)
+
+            if val and isinstance(val, str) and val.lower() != "null":
+                try:
+                    datetime.strptime(val, "%Y-%m-%d")
+                    properties[notion_column] = {"date": {"start": val}}
+                except ValueError:
+                    logger.warning(
+                        f"Skipping {notion_column}: Invalid format '{val}' in snippet."
+                    )
 
         try:
-            response = self.notion_client.pages.create(
-                **{
-                    "parent": {
-                        "type": "data_source_id",
-                        "data_source_id": self.snippet_db_id,
-                    },
-                    "properties": properties,
-                }
+            return self.client.pages.create(
+                parent={"data_source_id": self.snippet_db, "type": "data_source_id"},
+                properties=properties,
             )
-            logger.info(
-                "CREATED SNIPPET: %s | Source: %s",
-                snippet["context"][:50],
-                media_source,
-            )
-            return response
-
         except APIResponseError as e:
-            error_message = e.response.json().get("message", "")
-
-            if (
-                "Start Date" in error_message
-                or "End Date" in error_message
-                or e.status_code == 400
-            ):
-                logger.warning(
-                    "Date validation failed for snippet: %s. Attempting to retry without date properties.",
-                    snippet["context"][:50],
-                )
-
-                retry_properties = properties.copy()
-                retry_properties.pop("Start Date", None)
-                retry_properties.pop("End Date", None)
-
+            if e.status_code == 400:
+                logger.warning("Date error detected. Retrying without dates.")
+                properties.pop("Start Date", None)
+                properties.pop("End Date", None)
                 try:
-                    retry_response = self.notion_client.pages.create(
-                        **{
-                            "parent": {
-                                "type": "data_source_id",
-                                "data_source_id": self.snippet_db_id,
-                            },
-                            "properties": retry_properties,
-                        }
+                    return self.client.pages.create(
+                        parent={
+                            "data_source_id": self.snippet_db,
+                            "type": "data_source_id",
+                        },
+                        properties=properties,
                     )
-                    logger.info(
-                        "RETRY SUCCESS: Snippet created without problematic dates: %s",
-                        snippet["context"][:50],
-                    )
-                    return retry_response
-                except APIResponseError as retry_e:
-                    logger.error(
-                        "RETRY FAILED: API error creating snippet (no dates): %s | Context: %s",
-                        retry_e.status_code,
-                        snippet["context"][:50],
-                    )
+                except Exception:
                     return None
-
-            logger.error(
-                "API ERROR creating snippet: %s | Context: %s",
-                e.status_code,
-                snippet["context"][:50],
-            )
             return None

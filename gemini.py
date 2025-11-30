@@ -1,10 +1,11 @@
 import logging
-import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from google import genai
 from pydantic import BaseModel, Field
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -39,29 +40,28 @@ load_dotenv()
 
 class GeminiProcessor:
     def __init__(self):
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        if not config.GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY not found in environment variables.")
+
+        self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         logger.info("GeminiProcessor initialized.")
 
-    def _load_prompt(self, prompt_path):
         try:
-            with open(prompt_path, "r") as f:
-                content = f.read()
-                logger.info(
-                    f"Loaded system instruction from {prompt_path}."
-                )  # New log entry
-                return content
+            self.system_instruction = config.PROMPT_FILE.read_text(encoding="utf-8")
+            logger.info(f"Loaded system prompt from {config.PROMPT_FILE}")
         except FileNotFoundError:
-            logger.critical(f"Prompt file not found at {prompt_path}.")
-            raise
-        except Exception as e:
-            logger.error(f"Error loading prompt: {e}", exc_info=True)
+            logger.critical(f"Prompt file missing: {config.PROMPT_FILE}")
             raise
 
-    def _format_video_content(self, video_data):
+    def _format_video_content(self, video_data: Dict[str, Any]) -> str:
         title = video_data.get("title", "Unknown Title")
         description = video_data.get("description", "No description provided.")
         transcript_raw = video_data.get("transcript", [])
-        transcript_text = "\n".join(transcript_raw)
+        transcript_text = (
+            "\n".join(transcript_raw)
+            if isinstance(transcript_raw, list)
+            else str(transcript_raw)
+        )
 
         return (
             f"VIDEO TITLE: {title}\n\n"
@@ -69,17 +69,18 @@ class GeminiProcessor:
             f"TRANSCRIPT CONTENT:\n{transcript_text}"
         )
 
-    def summarize_video(self, prompt_path, video_data):
+    def summarize_video(self, video_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         logger.info("Starting Gemini summarization process.")
-        system_instruction = self._load_prompt(prompt_path)
-        full_content_text = self._format_video_content(video_data)
-
-        final_prompt = f"{system_instruction}\n\nDATA TO PROCESS:\n{full_content_text}"
 
         try:
+            full_content_text = self._format_video_content(video_data)
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=final_prompt,
+                contents=[
+                    self.system_instruction,
+                    "DATA TO PROCESS:",
+                    full_content_text,
+                ],
                 config={
                     "response_mime_type": "application/json",
                     "response_json_schema": SummaryResponse.model_json_schema(),
@@ -95,7 +96,6 @@ class GeminiProcessor:
             return None
 
         except Exception as e:
-            # Replaced print() with logger.error()
             logger.error(
                 f"Error validating or processing Gemini response: {e}", exc_info=True
             )
